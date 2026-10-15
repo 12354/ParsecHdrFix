@@ -131,7 +131,12 @@ static DWORD WINAPI cap_wgc_worker(void *opaque)
                 core_log(0, "Host HDR capture: refusing to start with a capture border");
                 winrt::throw_hresult(E_ACCESSDENIED);
             }
-            // Cursor is included by WGC; the host suppresses its separate cursor plane.
+            // Keep the cursor out of the video; the duplication reports it as a DXGI pointer instead.
+            stage = "cursor capture";
+            if (auto cursor = session.try_as<capture::IGraphicsCaptureSession2>())
+                cursor.IsCursorCaptureEnabled(false);
+            else
+                core_log(0, "Host HDR capture: this Windows version cannot hide the cursor");
             stage = "StartCapture";
             session.StartCapture();
             p->result = S_OK; SetEvent(p->done);

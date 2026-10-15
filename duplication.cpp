@@ -6,7 +6,57 @@
 #include <wrl/client.h>
 #include <new>
 #include <cstring>
+#include <vector>
 using Microsoft::WRL::ComPtr;
+
+// WGC cursor capture is off, so the pointer is reported through the documented
+// DXGI pointer fields and the consumer draws it as its own cursor plane.
+struct CURSOR_SAMPLE { HCURSOR handle=nullptr; bool visible=false; POINT position {}; };
+
+static bool cursor_bits(HDC dc,HBITMAP bitmap,LONG width,LONG height,WORD bpp,std::vector<BYTE> &out,UINT &stride)
+{
+    struct { BITMAPINFOHEADER header; RGBQUAD colors[2]; } info {};
+    info.header.biSize=sizeof(info.header); info.header.biWidth=width; info.header.biHeight=-height;
+    info.header.biPlanes=1; info.header.biBitCount=bpp; info.header.biCompression=BI_RGB;
+    stride=((UINT(width)*bpp+31)/32)*4; out.assign(size_t(stride)*height,0);
+    return GetDIBits(dc,bitmap,0,UINT(height),out.data(),reinterpret_cast<BITMAPINFO *>(&info),DIB_RGB_COLORS)==height;
+}
+
+// Converts an HCURSOR to the DXGI_OUTDUPL_POINTER_SHAPE_TYPE layouts.
+static bool cursor_shape(HCURSOR handle,std::vector<BYTE> &shape,DXGI_OUTDUPL_POINTER_SHAPE_INFO &info)
+{
+    ICONINFO icon {}; if(!GetIconInfo(handle,&icon)) return false;
+    struct OWNER { ICONINFO &icon; HDC dc=CreateCompatibleDC(nullptr);
+        ~OWNER() { if(dc) DeleteDC(dc); if(icon.hbmMask) DeleteObject(icon.hbmMask); if(icon.hbmColor) DeleteObject(icon.hbmColor); } } owner {icon};
+    BITMAP mask {};
+    if(!owner.dc || !icon.hbmMask || !GetObjectW(icon.hbmMask,sizeof(mask),&mask)) return false;
+    info={}; info.HotSpot={LONG(icon.xHotspot),LONG(icon.yHotspot)};
+    std::vector<BYTE> mask_bits; UINT mask_stride=0;
+    if(!icon.hbmColor) {
+        // AND plane above XOR plane, rows packed to whole bytes as DXGI delivers them.
+        if(mask.bmWidth<=0 || mask.bmWidth>256 || mask.bmHeight<=0 || mask.bmHeight>512) return false;
+        if(!cursor_bits(owner.dc,icon.hbmMask,mask.bmWidth,mask.bmHeight,1,mask_bits,mask_stride)) return false;
+        info.Type=DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
+        info.Width=UINT(mask.bmWidth); info.Height=UINT(mask.bmHeight); info.Pitch=(info.Width+7)/8;
+        shape.resize(size_t(info.Pitch)*info.Height);
+        for(UINT y=0;y<info.Height;++y) memcpy(&shape[size_t(y)*info.Pitch],&mask_bits[size_t(y)*mask_stride],info.Pitch);
+        return true;
+    }
+    BITMAP color {};
+    if(!GetObjectW(icon.hbmColor,sizeof(color),&color) || color.bmWidth<=0 || color.bmWidth>256 || color.bmHeight<=0 || color.bmHeight>256) return false;
+    UINT stride=0;
+    if(!cursor_bits(owner.dc,icon.hbmColor,color.bmWidth,color.bmHeight,32,shape,stride)) return false;
+    info.Width=UINT(color.bmWidth); info.Height=UINT(color.bmHeight); info.Pitch=stride;
+    bool alpha=false;
+    for(size_t i=3;i<shape.size();i+=4) if(shape[i]) { alpha=true; break; }
+    if(alpha) { info.Type=DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR; return true; }
+    // No alpha: AND mask bit set means XOR with the screen (alpha 0xFF), else replace (alpha 0).
+    if(!cursor_bits(owner.dc,icon.hbmMask,color.bmWidth,color.bmHeight,1,mask_bits,mask_stride)) return false;
+    info.Type=DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR;
+    for(UINT y=0;y<info.Height;++y) for(UINT x=0;x<info.Width;++x)
+        shape[size_t(y)*stride+x*4+3]=(mask_bits[size_t(y)*mask_stride+x/8]&(0x80>>(x&7)))?0xff:0x00;
+    return true;
+}
 
 class HDR_DUPLICATION final : public IDXGIOutputDuplication {
     volatile LONG refs=1;
@@ -19,7 +69,37 @@ class HDR_DUPLICATION final : public IDXGIOutputDuplication {
     CAP_HDR *mapper=nullptr;
     SHIM_CAPTURE *capture=nullptr;
     DXGI_OUTDUPL_DESC desc {};
-    bool acquired=false, lost=false, delivered=false;
+    bool acquired=false, lost=false, delivered=false, pointer_only=false;
+    RECT bounds {};
+    CURSOR_SAMPLE cursor;
+    bool cursor_known=false;
+    std::vector<BYTE> shape;
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info {};
+
+    CURSOR_SAMPLE sample_cursor() {
+        CURSORINFO ci {sizeof(ci)};
+        if(!GetCursorInfo(&ci)) return cursor; // e.g. secure desktop: keep the last state.
+        CURSOR_SAMPLE now;
+        now.handle=ci.hCursor;
+        now.visible=ci.hCursor && (ci.flags&CURSOR_SHOWING) && !(ci.flags&CURSOR_SUPPRESSED) && PtInRect(&bounds,ci.ptScreenPos);
+        now.position={ci.ptScreenPos.x-bounds.left,ci.ptScreenPos.y-bounds.top};
+        return now;
+    }
+    bool cursor_changed(const CURSOR_SAMPLE &now) const {
+        return !cursor_known || now.handle!=cursor.handle || now.visible!=cursor.visible;
+    }
+    // Like DXGI: LastMouseUpdateTime and the shape size are set only when they change.
+    void report_cursor(const CURSOR_SAMPLE &now,DXGI_OUTDUPL_FRAME_INFO *info) {
+        info->PointerPosition.Position=now.position; info->PointerPosition.Visible=now.visible;
+        if(!cursor_changed(now)) return;
+        QueryPerformanceCounter(&info->LastMouseUpdateTime);
+        if(!cursor_known || now.handle!=cursor.handle) {
+            shape.clear(); shape_info={};
+            if(now.handle && !cursor_shape(now.handle,shape,shape_info)) { shape.clear(); shape_info={}; }
+            info->PointerShapeBufferSize=UINT(shape.size());
+        }
+        cursor=now; cursor_known=true;
+    }
 public:
     ~HDR_DUPLICATION() {
         if(acquired) reader->ReleaseSync(0);
@@ -43,6 +123,7 @@ public:
         if(!mapper) return E_OUTOFMEMORY;
         if(!cap_hdr_enabled(mapper)) return DXGI_ERROR_ACCESS_LOST;
         desc.Rotation=od.Rotation>=DXGI_MODE_ROTATION_IDENTITY && od.Rotation<=DXGI_MODE_ROTATION_ROTATE270 ? od.Rotation : DXGI_MODE_ROTATION_IDENTITY;
+        bounds=od.DesktopCoordinates;
         desc.ModeDesc.Width=od.DesktopCoordinates.right-od.DesktopCoordinates.left;
         desc.ModeDesc.Height=od.DesktopCoordinates.bottom-od.DesktopCoordinates.top;
         if(desc.Rotation==DXGI_MODE_ROTATION_ROTATE90 || desc.Rotation==DXGI_MODE_ROTATION_ROTATE270) {
@@ -87,32 +168,40 @@ public:
         if(lost || !cap_hdr_refresh(mapper)) return DXGI_ERROR_ACCESS_LOST;
         ComPtr<ID3D11Texture2D> frame;
         HRESULT hr=shim_capture_acquire(capture,timeout,&frame);
-        if(hr==DXGI_ERROR_WAIT_TIMEOUT) return hr;
-        if(SUCCEEDED(hr)) hr=cap_hdr_convert(mapper,frame.GetAddressOf(),desc.Rotation);
-        if(FAILED(hr)) { lost=true; core_log(0,"HDR API v3: capture lost (0x%08lx), requesting duplication recreation",hr); return DXGI_ERROR_ACCESS_LOST; }
-        D3D11_TEXTURE2D_DESC actual {}; frame->GetDesc(&actual);
-        if(actual.Width!=desc.ModeDesc.Width || actual.Height!=desc.ModeDesc.Height) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
+        const CURSOR_SAMPLE now=sample_cursor();
+        // WGC has no frame for pointer-only changes; DXGI reports them with LastPresentTime 0.
+        const bool fresh=hr!=DXGI_ERROR_WAIT_TIMEOUT;
+        if(!fresh && (!delivered || !cursor_changed(now))) return hr;
+        if(fresh) {
+            if(SUCCEEDED(hr)) hr=cap_hdr_convert(mapper,frame.GetAddressOf(),desc.Rotation);
+            if(FAILED(hr)) { lost=true; core_log(0,"HDR API v3: capture lost (0x%08lx), requesting duplication recreation",hr); return DXGI_ERROR_ACCESS_LOST; }
+            D3D11_TEXTURE2D_DESC actual {}; frame->GetDesc(&actual);
+            if(actual.Width!=desc.ModeDesc.Width || actual.Height!=desc.ModeDesc.Height) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
+        }
         // Producer key 0 -> consumer key 1. Holding the consumer mutex until
         // ReleaseFrame preserves the original duplication ownership contract.
         hr=writer->AcquireSync(0,1000);
         if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        context->CopyResource(shared.Get(),frame.Get());
+        if(fresh) context->CopyResource(shared.Get(),frame.Get());
         hr=writer->ReleaseSync(1);
         if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
         hr=reader->AcquireSync(1,1000);
         if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        acquired=true;
-        info->AccumulatedFrames=1; QueryPerformanceCounter(&info->LastPresentTime);
-        info->LastMouseUpdateTime=info->LastPresentTime;
-        info->PointerPosition.Visible=FALSE; // WGC includes the cursor in video.
-        info->TotalMetadataBufferSize=sizeof(RECT);
-        *out=resource.Get(); (*out)->AddRef(); InterlockedIncrement(&hdr_frames);
-        if(!delivered) { delivered=true;core_log(1,"HDR API v3: first tone-mapped frame delivered (%ux%u)",desc.ModeDesc.Width,desc.ModeDesc.Height); }
+        acquired=true; pointer_only=!fresh;
+        if(fresh) {
+            info->AccumulatedFrames=1; QueryPerformanceCounter(&info->LastPresentTime);
+            info->TotalMetadataBufferSize=sizeof(RECT);
+        }
+        report_cursor(now,info);
+        *out=resource.Get(); (*out)->AddRef();
+        if(fresh) InterlockedIncrement(&hdr_frames);
+        if(fresh && !delivered) { delivered=true;core_log(1,"HDR API v3: first tone-mapped frame delivered (%ux%u)",desc.ModeDesc.Width,desc.ModeDesc.Height); }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetFrameDirtyRects(UINT size,RECT *rects,UINT *required) override {
-        if(!required) return E_INVALIDARG; *required=sizeof(RECT);
+        if(!required) return E_INVALIDARG; *required=pointer_only?0:sizeof(RECT);
         if(!acquired) return DXGI_ERROR_INVALID_CALL;
+        if(pointer_only) return S_OK;
         if(size<sizeof(RECT)) return DXGI_ERROR_MORE_DATA;
         if(!rects) return E_INVALIDARG;
         *rects={0,0,LONG(desc.ModeDesc.Width),LONG(desc.ModeDesc.Height)}; return S_OK;
@@ -121,9 +210,13 @@ public:
         if(!required) return E_INVALIDARG; *required=0;
         return acquired?S_OK:DXGI_ERROR_INVALID_CALL;
     }
-    HRESULT STDMETHODCALLTYPE GetFramePointerShape(UINT,void *,UINT *required,DXGI_OUTDUPL_POINTER_SHAPE_INFO *info) override {
-        if(!required||!info) return E_INVALIDARG; *required=0; *info={};
-        return acquired?S_OK:DXGI_ERROR_INVALID_CALL;
+    HRESULT STDMETHODCALLTYPE GetFramePointerShape(UINT size,void *buffer,UINT *required,DXGI_OUTDUPL_POINTER_SHAPE_INFO *info) override {
+        if(!required||!info) return E_INVALIDARG; *required=UINT(shape.size()); *info={};
+        if(!acquired) return DXGI_ERROR_INVALID_CALL;
+        if(shape.empty()) return S_OK;
+        if(size<shape.size()) return DXGI_ERROR_MORE_DATA;
+        if(!buffer) return E_INVALIDARG;
+        memcpy(buffer,shape.data(),shape.size()); *info=shape_info; return S_OK;
     }
     HRESULT STDMETHODCALLTYPE MapDesktopSurface(DXGI_MAPPED_RECT *out) override {
         if(!out) return E_INVALIDARG; *out={}; return acquired?DXGI_ERROR_UNSUPPORTED:DXGI_ERROR_INVALID_CALL;
