@@ -93,7 +93,7 @@ static HRESULT create_worker(SHIM_CAPTURE *p,ID3D11Device *device,HMONITOR monit
     if(!ConnectNamedPipe(p->pipe.value,&ov)) {
         error=GetLastError();
         if(error==ERROR_IO_PENDING) {
-            HANDLE waits[]={event.value,p->process.value};DWORD wait=WaitForMultipleObjects(2,waits,FALSE,15000);DWORD transferred=0;
+            HANDLE waits[]={event.value,p->process.value};DWORD wait=WaitForMultipleObjects(2,waits,FALSE,5000);DWORD transferred=0;
             if(wait!=WAIT_OBJECT_0){CancelIoEx(p->pipe.value,&ov);GetOverlappedResult(p->pipe.value,&ov,&transferred,TRUE);return E_ABORT;}
             if(!GetOverlappedResult(p->pipe.value,&ov,&transferred,FALSE))return last_error();
         } else if(error!=ERROR_PIPE_CONNECTED)return HRESULT_FROM_WIN32(error);
@@ -104,7 +104,9 @@ static HRESULT create_worker(SHIM_CAPTURE *p,ID3D11Device *device,HMONITOR monit
     hr=dxgi->GetAdapter(&adapter);if(FAILED(hr))return hr;hr=adapter->GetDesc(&desc);if(FAILED(hr))return hr;
     INIT init;init.adapter=desc.AdapterLuid;init.monitor=reinterpret_cast<UINT64>(monitor);
     hr=transfer(p->pipe.value,p->process.value,true,&init,sizeof(init),5000);if(FAILED(hr))return hr;
-    READY ready;hr=transfer(p->pipe.value,p->process.value,false,&ready,sizeof(ready),40000);if(FAILED(hr))return hr;
+    // This all runs inside Parsec's DuplicateOutput call, so it is kept short:
+    // the worker's own permission wait (5 s) plus WGC setup must fit in here.
+    READY ready;hr=transfer(p->pipe.value,p->process.value,false,&ready,sizeof(ready),8000);if(FAILED(hr))return hr;
     if(ready.magic!=protocol)return E_FAIL;if(FAILED(ready.hr))return ready.hr;
     hr=device->OpenSharedResource(reinterpret_cast<HANDLE>(ready.texture),IID_PPV_ARGS(&p->texture));if(FAILED(hr))return hr;
     D3D11_TEXTURE2D_DESC td {};p->texture->GetDesc(&td);if(td.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT)return E_FAIL;

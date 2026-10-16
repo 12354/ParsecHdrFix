@@ -11,7 +11,12 @@ struct HDR_SHIM_STATS {
 extern volatile LONG hdr_factories, hdr_duplication_calls, hdr_sessions, hdr_fallbacks, hdr_frames;
 void api_bootstrap(HMODULE self);
 void api_hook_factory(IUnknown *factory);
-HRESULT hdr_duplication_create(IDXGIOutput *output, IUnknown *device, IDXGIOutputDuplication **out);
+// format: what the consumer receives (B8G8R8A8_UNORM or R10G10B10A2_UNORM).
+// S_OK: handled. Otherwise the original call runs, unless *report is set: then
+// hr is a transient desktop error the original would also hit, returned as-is.
+HRESULT hdr_duplication_create(IDXGIOutput *output, IUnknown *device, DXGI_FORMAT format, IDXGIOutputDuplication **out, bool *report);
+// Genuine IDXGIOutput5::DuplicateOutput1, bypassing our own hook.
+HRESULT api_native_duplicate1(IDXGIOutput *output, IUnknown *device, UINT count, const DXGI_FORMAT *formats, IDXGIOutputDuplication **out);
 void shim_pin();
 // SDK-derived offsets, compiled as C so C++ does not guess COM slots.
 extern "C" {

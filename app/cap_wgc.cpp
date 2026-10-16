@@ -59,8 +59,9 @@ static bool cap_wgc_request_borderless(capture::GraphicsCaptureSession const &se
         if (!signal->event) winrt::throw_last_error();
         request.Completed([signal](auto const &, auto) { SetEvent(signal->event); });
         HANDLE waits[] = {stop, signal->event};
-        // Do not trap host shutdown indefinitely behind an unanswered OS prompt.
-        if (WaitForMultipleObjects(2, waits, FALSE, 30000) != WAIT_OBJECT_0 + 1) {
+        // Runs inside the host's duplication call: an unanswered OS prompt must not
+        // stall it. Desktop apps are normally answered immediately, without a prompt.
+        if (WaitForMultipleObjects(2, waits, FALSE, 5000) != WAIT_OBJECT_0 + 1) {
             request.Cancel();
             core_log(0, "Host HDR capture: borderless permission request did not complete");
             return false;

@@ -1,6 +1,6 @@
 // Local host extension. FP16 duplication is linear Rec.709/scRGB, not PQ.
 Texture2D<float4> desktop : register(t0);
-cbuffer Parameters : register(b0) { float white; float rotation; float2 padding; };
+cbuffer Parameters : register(b0) { float white; float rotation; float passthrough; float padding; };
 
 float4 vs_main(uint id : SV_VertexID) : SV_Position
 {
@@ -20,6 +20,8 @@ float4 ps_main(float4 position : SV_Position) : SV_Target
     if (rotation == 2) pixel = int2(int(w) - 1 - pixel.y, pixel.x);
     else if (rotation == 3) pixel = int2(int(w) - 1 - pixel.x, int(h) - 1 - pixel.y);
     else if (rotation == 4) pixel = int2(pixel.y, int(h) - 1 - pixel.x);
+    // An 8-bit UNORM source is already sRGB-encoded SDR; only the target format differs.
+    if (passthrough > 0.5) return float4(desktop.Load(int3(pixel, 0)).rgb, 1);
     float3 rgb = desktop.Load(int3(pixel, 0)).rgb / max(white, 0.001);
     float luminance = max(dot(rgb, float3(0.2126, 0.7152, 0.0722)), 0);
     // Preserve shadows/midtones; smooth shoulder reserves room for HDR highlights.

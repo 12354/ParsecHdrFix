@@ -1,4 +1,5 @@
-// IDXGIOutputDuplication implementation backed by borderless FP16 WGC.
+// IDXGIOutputDuplication implementation backed by an FP16 scRGB source: DXGI
+// duplication (as OBS does), else borderless WGC. Both feed the same tone mapper.
 #include "api.h"
 #include "app/cap_hdr.h"
 #include "capture_source.h"
@@ -64,10 +65,14 @@ class HDR_DUPLICATION final : public IDXGIOutputDuplication {
     ComPtr<ID3D11Device> consumer, producer;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11Texture2D> shared, visible;
+    ComPtr<ID3D11RenderTargetView> target; // On shared: the tone mapper draws straight into it.
     ComPtr<IDXGIKeyedMutex> writer, reader;
     ComPtr<IDXGIResource> resource;
     CAP_HDR *mapper=nullptr;
     SHIM_CAPTURE *capture=nullptr;
+    // DXGI source: its frame stays checked out until the consumer's ReleaseFrame.
+    ComPtr<IDXGIOutputDuplication> dda;
+    bool dda_held=false, warned_bgra=false;
     DXGI_OUTDUPL_DESC desc {};
     bool acquired=false, lost=false, delivered=false, pointer_only=false;
     RECT bounds {};
@@ -100,12 +105,96 @@ class HDR_DUPLICATION final : public IDXGIOutputDuplication {
         }
         cursor=now; cursor_known=true;
     }
+    // True when the frame, after undoing rotation, is exactly the consumer texture's size.
+    bool fits(ID3D11Texture2D *frame,DXGI_MODE_ROTATION rotation) const {
+        D3D11_TEXTURE2D_DESC td {}; frame->GetDesc(&td);
+        const bool swap=rotation==DXGI_MODE_ROTATION_ROTATE90 || rotation==DXGI_MODE_ROTATION_ROTATE270;
+        return (swap?td.Height:td.Width)==desc.ModeDesc.Width && (swap?td.Width:td.Height)==desc.ModeDesc.Height;
+    }
+    // Producer key 0 -> consumer key 1. Holding the consumer mutex until
+    // ReleaseFrame preserves the original duplication ownership contract.
+    // The frame is tone mapped straight into the consumer texture (draw) or copied
+    // as is; a null frame is a pointer-only update that leaves the image as it was.
+    HRESULT publish(ID3D11Texture2D *frame,bool draw,DXGI_MODE_ROTATION rotation) {
+        if(writer->AcquireSync(0,1000)!=S_OK) return DXGI_ERROR_ACCESS_LOST;
+        HRESULT hr=S_OK;
+        if(frame && draw) hr=cap_hdr_draw(mapper,frame,target.Get(),rotation);
+        else if(frame) context->CopyResource(shared.Get(),frame);
+        if(writer->ReleaseSync(1)!=S_OK) return DXGI_ERROR_ACCESS_LOST;
+        if(FAILED(hr)) return hr;
+        if(reader->AcquireSync(1,1000)!=S_OK) return DXGI_ERROR_ACCESS_LOST;
+        acquired=true; pointer_only=!frame;
+        if(frame) {
+            InterlockedIncrement(&hdr_frames);
+            if(!delivered) { delivered=true; core_log(1,"HDR API v3: first tone-mapped frame delivered (%ux%u)",desc.ModeDesc.Width,desc.ModeDesc.Height); }
+        }
+        return S_OK;
+    }
+    // DXGI hands out the unrotated surface, so no rotation is undone here.
+    // Sets draw when the frame needs the shader rather than a plain copy.
+    HRESULT check_dda(ID3D11Texture2D *frame,bool &draw) {
+        D3D11_TEXTURE2D_DESC td {}; frame->GetDesc(&td);
+        if(td.Format==DXGI_FORMAT_B8G8R8A8_UNORM) {
+            // DXGI chose the 8-bit format (e.g. an SDR fullscreen app): nothing to tone map.
+            if(!warned_bgra) { warned_bgra=true; core_log(0,"HDR API v3: DXGI delivered BGRA instead of FP16, passing it through"); }
+            draw=desc.ModeDesc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM;
+        } else if(td.Format==DXGI_FORMAT_R16G16B16A16_FLOAT) draw=true;
+        else return DXGI_ERROR_UNSUPPORTED;
+        return fits(frame,DXGI_MODE_ROTATION_IDENTITY) ? S_OK : DXGI_ERROR_ACCESS_LOST;
+    }
+    HRESULT acquire_dda(UINT timeout,DXGI_OUTDUPL_FRAME_INFO *info) {
+        DXGI_OUTDUPL_FRAME_INFO native {}; ComPtr<IDXGIResource> desktop;
+        HRESULT hr=dda->AcquireNextFrame(timeout,&native,&desktop);
+        // Timeouts, ACCESS_LOST after mode switches etc. reach Parsec exactly as DXGI reports them.
+        if(FAILED(hr)) {
+            if(hr!=DXGI_ERROR_WAIT_TIMEOUT) core_log(0,"HDR API v3: DXGI FP16 AcquireNextFrame failed (0x%08lx)",hr);
+            return hr;
+        }
+        dda_held=true;
+        ComPtr<ID3D11Texture2D> frame; bool draw=true;
+        if(native.LastPresentTime.QuadPart) {
+            hr=desktop.As(&frame);
+            if(SUCCEEDED(hr)) hr=check_dda(frame.Get(),draw);
+        }
+        if(SUCCEEDED(hr)) hr=publish(frame.Get(),draw,DXGI_MODE_ROTATION_IDENTITY);
+        if(FAILED(hr)) {
+            dda->ReleaseFrame(); dda_held=false; lost=true;
+            core_log(0,"HDR API v3: DXGI FP16 frame lost (0x%08lx), requesting duplication recreation",hr);
+            return DXGI_ERROR_ACCESS_LOST;
+        }
+        // Pointer position/shape, timestamps and protection flags are DXGI's own.
+        *info=native;
+        info->TotalMetadataBufferSize=frame?sizeof(RECT):0;
+        return S_OK;
+    }
+    HRESULT acquire_wgc(UINT timeout,DXGI_OUTDUPL_FRAME_INFO *info) {
+        ComPtr<ID3D11Texture2D> frame;
+        HRESULT hr=shim_capture_acquire(capture,timeout,&frame);
+        const CURSOR_SAMPLE now=sample_cursor();
+        // WGC has no frame for pointer-only changes; DXGI reports them with LastPresentTime 0.
+        const bool fresh=hr!=DXGI_ERROR_WAIT_TIMEOUT;
+        if(!fresh && (!delivered || !cursor_changed(now))) return hr;
+        if(fresh) {
+            if(FAILED(hr)) { lost=true; core_log(0,"HDR API v3: capture lost (0x%08lx), requesting duplication recreation",hr); return DXGI_ERROR_ACCESS_LOST; }
+            if(!fits(frame.Get(),desc.Rotation)) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
+        }
+        // WGC returns the display orientation; the shader undoes it for DXGI's raw-surface ABI.
+        hr=publish(fresh?frame.Get():nullptr,true,desc.Rotation);
+        if(FAILED(hr)) { lost=true; core_log(0,"HDR API v3: capture lost (0x%08lx), requesting duplication recreation",hr); return DXGI_ERROR_ACCESS_LOST; }
+        if(fresh) {
+            info->AccumulatedFrames=1; QueryPerformanceCounter(&info->LastPresentTime);
+            info->TotalMetadataBufferSize=sizeof(RECT);
+        }
+        report_cursor(now,info);
+        return S_OK;
+    }
 public:
     ~HDR_DUPLICATION() {
         if(acquired) reader->ReleaseSync(0);
+        if(dda_held) dda->ReleaseFrame();
         shim_capture_destroy(&capture); cap_hdr_destroy(&mapper);
     }
-    HRESULT initialize(IDXGIOutput *monitor,IUnknown *device) {
+    HRESULT initialize(IDXGIOutput *monitor,IUnknown *device,bool use_dda,DXGI_FORMAT format) {
         output=monitor;
         HRESULT hr=device->QueryInterface(IID_PPV_ARGS(&consumer)); if(FAILED(hr)) return hr;
         DXGI_OUTPUT_DESC od {}; hr=output->GetDesc(&od); if(FAILED(hr)) return hr;
@@ -119,24 +208,33 @@ public:
         hr=D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             nullptr,0,D3D11_SDK_VERSION,&producer,nullptr,&context);
         if(FAILED(hr)) return hr;
-        mapper=cap_hdr_create(producer.Get(),output.Get());
+        mapper=cap_hdr_create(producer.Get(),output.Get(),format);
         if(!mapper) return E_OUTOFMEMORY;
         if(!cap_hdr_enabled(mapper)) return DXGI_ERROR_ACCESS_LOST;
-        desc.Rotation=od.Rotation>=DXGI_MODE_ROTATION_IDENTITY && od.Rotation<=DXGI_MODE_ROTATION_ROTATE270 ? od.Rotation : DXGI_MODE_ROTATION_IDENTITY;
         bounds=od.DesktopCoordinates;
-        desc.ModeDesc.Width=od.DesktopCoordinates.right-od.DesktopCoordinates.left;
-        desc.ModeDesc.Height=od.DesktopCoordinates.bottom-od.DesktopCoordinates.top;
-        if(desc.Rotation==DXGI_MODE_ROTATION_ROTATE90 || desc.Rotation==DXGI_MODE_ROTATION_ROTATE270) {
-            UINT w=desc.ModeDesc.Width; desc.ModeDesc.Width=desc.ModeDesc.Height; desc.ModeDesc.Height=w;
+        if(use_dda) {
+            // OBS's approach: DXGI delivers the HDR desktop as linear FP16 scRGB.
+            // No border, no permission, and it works as SYSTEM. BGRA is the documented companion format.
+            const DXGI_FORMAT formats[]={DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_B8G8R8A8_UNORM};
+            hr=api_native_duplicate1(output.Get(),producer.Get(),_countof(formats),formats,&dda); if(FAILED(hr)) return hr;
+            dda->GetDesc(&desc);
+        } else {
+            desc.Rotation=od.Rotation>=DXGI_MODE_ROTATION_IDENTITY && od.Rotation<=DXGI_MODE_ROTATION_ROTATE270 ? od.Rotation : DXGI_MODE_ROTATION_IDENTITY;
+            desc.ModeDesc.Width=od.DesktopCoordinates.right-od.DesktopCoordinates.left;
+            desc.ModeDesc.Height=od.DesktopCoordinates.bottom-od.DesktopCoordinates.top;
+            if(desc.Rotation==DXGI_MODE_ROTATION_ROTATE90 || desc.Rotation==DXGI_MODE_ROTATION_ROTATE270) {
+                UINT w=desc.ModeDesc.Width; desc.ModeDesc.Width=desc.ModeDesc.Height; desc.ModeDesc.Height=w;
+            }
+            desc.ModeDesc.RefreshRate={0,1};
         }
-        desc.ModeDesc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.ModeDesc.RefreshRate={0,1}; desc.DesktopImageInSystemMemory=FALSE;
+        desc.ModeDesc.Format=format; desc.DesktopImageInSystemMemory=FALSE;
         D3D11_TEXTURE2D_DESC td {};
         td.Width=desc.ModeDesc.Width; td.Height=desc.ModeDesc.Height;
         td.MipLevels=td.ArraySize=1; td.Format=desc.ModeDesc.Format; td.SampleDesc.Count=1;
         td.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
         td.MiscFlags=D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
         hr=producer->CreateTexture2D(&td,nullptr,&shared); if(FAILED(hr)) return hr;
+        hr=producer->CreateRenderTargetView(shared.Get(),nullptr,&target); if(FAILED(hr)) return hr;
         ComPtr<IDXGIResource> exported; hr=shared.As(&exported); if(FAILED(hr)) return hr;
         HANDLE handle=nullptr; hr=exported->GetSharedHandle(&handle); if(FAILED(hr)) return hr;
         // Legacy shared handles from GetSharedHandle are not NT handles to close.
@@ -144,6 +242,7 @@ public:
         hr=shared.As(&writer); if(FAILED(hr)) return hr;
         hr=visible.As(&reader); if(FAILED(hr)) return hr;
         hr=visible.As(&resource); if(FAILED(hr)) return hr;
+        if(dda) return S_OK;
         // Strict borderless: failure occurs before StartCapture. Caller uses native DXGI.
         return shim_capture_create(&capture,producer.Get(),od.Monitor);
     }
@@ -166,36 +265,9 @@ public:
         *out=nullptr; *info={};
         if(acquired) return DXGI_ERROR_INVALID_CALL;
         if(lost || !cap_hdr_refresh(mapper)) return DXGI_ERROR_ACCESS_LOST;
-        ComPtr<ID3D11Texture2D> frame;
-        HRESULT hr=shim_capture_acquire(capture,timeout,&frame);
-        const CURSOR_SAMPLE now=sample_cursor();
-        // WGC has no frame for pointer-only changes; DXGI reports them with LastPresentTime 0.
-        const bool fresh=hr!=DXGI_ERROR_WAIT_TIMEOUT;
-        if(!fresh && (!delivered || !cursor_changed(now))) return hr;
-        if(fresh) {
-            if(SUCCEEDED(hr)) hr=cap_hdr_convert(mapper,frame.GetAddressOf(),desc.Rotation);
-            if(FAILED(hr)) { lost=true; core_log(0,"HDR API v3: capture lost (0x%08lx), requesting duplication recreation",hr); return DXGI_ERROR_ACCESS_LOST; }
-            D3D11_TEXTURE2D_DESC actual {}; frame->GetDesc(&actual);
-            if(actual.Width!=desc.ModeDesc.Width || actual.Height!=desc.ModeDesc.Height) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        }
-        // Producer key 0 -> consumer key 1. Holding the consumer mutex until
-        // ReleaseFrame preserves the original duplication ownership contract.
-        hr=writer->AcquireSync(0,1000);
-        if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        if(fresh) context->CopyResource(shared.Get(),frame.Get());
-        hr=writer->ReleaseSync(1);
-        if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        hr=reader->AcquireSync(1,1000);
-        if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
-        acquired=true; pointer_only=!fresh;
-        if(fresh) {
-            info->AccumulatedFrames=1; QueryPerformanceCounter(&info->LastPresentTime);
-            info->TotalMetadataBufferSize=sizeof(RECT);
-        }
-        report_cursor(now,info);
+        HRESULT hr=dda?acquire_dda(timeout,info):acquire_wgc(timeout,info);
+        if(hr!=S_OK) return hr;
         *out=resource.Get(); (*out)->AddRef();
-        if(fresh) InterlockedIncrement(&hdr_frames);
-        if(fresh && !delivered) { delivered=true;core_log(1,"HDR API v3: first tone-mapped frame delivered (%ux%u)",desc.ModeDesc.Width,desc.ModeDesc.Height); }
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetFrameDirtyRects(UINT size,RECT *rects,UINT *required) override {
@@ -211,6 +283,7 @@ public:
         return acquired?S_OK:DXGI_ERROR_INVALID_CALL;
     }
     HRESULT STDMETHODCALLTYPE GetFramePointerShape(UINT size,void *buffer,UINT *required,DXGI_OUTDUPL_POINTER_SHAPE_INFO *info) override {
+        if(dda) return acquired?dda->GetFramePointerShape(size,buffer,required,info):DXGI_ERROR_INVALID_CALL;
         if(!required||!info) return E_INVALIDARG; *required=UINT(shape.size()); *info={};
         if(!acquired) return DXGI_ERROR_INVALID_CALL;
         if(shape.empty()) return S_OK;
@@ -225,24 +298,75 @@ public:
     HRESULT STDMETHODCALLTYPE ReleaseFrame() override {
         if(!acquired) return DXGI_ERROR_INVALID_CALL;
         acquired=false; HRESULT hr=reader->ReleaseSync(0);
+        HRESULT source=S_OK;
+        if(dda_held) { dda_held=false; source=dda->ReleaseFrame(); }
         if(hr!=S_OK) { lost=true; return DXGI_ERROR_ACCESS_LOST; }
+        if(FAILED(source)) { lost=true; return source; }
         return S_OK;
     }
 };
 
-HRESULT hdr_duplication_create(IDXGIOutput *output,IUnknown *device,IDXGIOutputDuplication **out)
+// Desktop states in which Parsec's own duplication fails the same way and simply
+// retries: secure desktop (UAC, lock screen) for non-SYSTEM hosts, mode changes,
+// disconnected sessions, an HDR toggle racing creation. They never mean DXGI is
+// unusable, however long they last, so they never trigger the fallbacks.
+static bool desktop_state(HRESULT hr)
 {
-    if(!output||!device||!out) return E_INVALIDARG;
-    *out=nullptr;
+    return hr==E_ACCESSDENIED || hr==DXGI_ERROR_SESSION_DISCONNECTED ||
+        hr==DXGI_ERROR_MODE_CHANGE_IN_PROGRESS || hr==DXGI_ERROR_ACCESS_LOST;
+}
+// Usually transient too, but may also be permanent (driver, duplication limit),
+// so only a few consecutive ones are reported before the fallbacks are tried.
+static bool maybe_transient(HRESULT hr)
+{
+    return hr==DXGI_ERROR_UNSUPPORTED || hr==DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+}
+static volatile LONG transient_failures;
+
+HRESULT hdr_duplication_create(IDXGIOutput *output,IUnknown *device,DXGI_FORMAT format,IDXGIOutputDuplication **out,bool *report)
+{
+    if(!output||!device||!out||!report) return E_INVALIDARG;
+    *out=nullptr; *report=false;
     ComPtr<IDXGIOutput6> hdr_output; DXGI_OUTPUT_DESC1 desc {};
-    if(FAILED(output->QueryInterface(IID_PPV_ARGS(&hdr_output))) || FAILED(hdr_output->GetDesc1(&desc)) ||
-        desc.ColorSpace!=DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) return S_FALSE;
-    auto *p=new(std::nothrow) HDR_DUPLICATION;
-    if(!p) return E_OUTOFMEMORY;
-    HRESULT hr;
-    try { hr=p->initialize(output,device); } catch(...) { hr=E_FAIL; }
-    if(FAILED(hr)) { p->Release(); return hr; }
-    *out=p; InterlockedIncrement(&hdr_sessions);
-    core_log(1,"HDR API v3 ACTIVE: Windows DXGI hook -> borderless full FP16 scRGB -> SDR BGRA");
-    return S_OK;
+    if(FAILED(output->QueryInterface(IID_PPV_ARGS(&hdr_output))) || FAILED(hdr_output->GetDesc1(&desc))) {
+        core_log(0,"HDR API v3: output has no IDXGIOutput6 description, Parsec capture unchanged");
+        return S_FALSE;
+    }
+    if(desc.ColorSpace!=DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+        core_log(1,"HDR API v3: %ls is not in HDR mode (color space %d), Parsec capture unchanged",desc.DeviceName,int(desc.ColorSpace));
+        return S_FALSE;
+    }
+    // Each source is torn down completely before the next one is tried; when all
+    // fail the caller runs Parsec's own duplication as if the shim were absent.
+    const struct { bool dda; const char *name; } sources[]={
+        {true,"DXGI duplication FP16"}, {false,"borderless Windows Graphics Capture FP16"}};
+    // Testing aid: PARSEC_HDR_SHIM_SOURCE=wgc skips DXGI, =native skips both.
+    char forced[16]=""; GetEnvironmentVariableA("PARSEC_HDR_SHIM_SOURCE",forced,sizeof(forced));
+    const char *target=format==DXGI_FORMAT_R10G10B10A2_UNORM?"SDR RGB10A2":"SDR BGRA";
+    HRESULT hr=E_FAIL;
+    for(const auto &source : sources) {
+        if((source.dda && (!_stricmp(forced,"wgc") || !_stricmp(forced,"native"))) || (!source.dda && !_stricmp(forced,"native"))) {
+            core_log(0,"HDR API v3: %s skipped by PARSEC_HDR_SHIM_SOURCE=%s",source.name,forced);
+            continue;
+        }
+        auto *p=new(std::nothrow) HDR_DUPLICATION;
+        if(!p) return E_OUTOFMEMORY;
+        try { hr=p->initialize(output,device,source.dda,format); } catch(...) { hr=E_FAIL; }
+        if(hr==S_OK) {
+            *out=p; InterlockedIncrement(&hdr_sessions);
+            if(source.dda) InterlockedExchange(&transient_failures,0);
+            core_log(1,"HDR API v3 ACTIVE on %ls: %s -> %s",desc.DeviceName,source.name,target);
+            return S_OK;
+        }
+        p->Release();
+        // Starting WGC takes seconds and cannot see the secure desktop, so a desktop
+        // state change is reported to Parsec, which retries. Persistent failures still fall back.
+        if(source.dda && (desktop_state(hr) || (maybe_transient(hr) && InterlockedIncrement(&transient_failures)<=5))) {
+            core_log(0,"HDR API v3: DXGI duplication not available right now on %ls (0x%08lx), Parsec will retry",desc.DeviceName,hr);
+            *report=true; return hr;
+        }
+        core_log(0,"HDR API v3: %s unavailable on %ls (0x%08lx)",source.name,desc.DeviceName,hr);
+        if(SUCCEEDED(hr)) hr=E_FAIL;
+    }
+    return hr;
 }

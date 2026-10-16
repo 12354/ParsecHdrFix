@@ -3,6 +3,7 @@
 #include "app/log.h"
 #include <wrl/client.h>
 #include <cstring>
+#include <cstdio>
 using Microsoft::WRL::ComPtr;
 volatile LONG hdr_factories, hdr_duplication_calls, hdr_sessions, hdr_fallbacks, hdr_frames;
 static HMODULE own_module;
@@ -88,11 +89,21 @@ static HRESULT STDMETHODCALLTYPE duplicate(IDXGIOutput1 *self, IUnknown *device,
     if (!fn) return E_FAIL;
     if (!native_duplication && device && out) {
         InterlockedIncrement(&hdr_duplication_calls);
-        HRESULT hr = hdr_duplication_create(self,device,out);
-        if (hr == S_OK) return hr;
-        if (FAILED(hr)) { InterlockedIncrement(&hdr_fallbacks); core_log(0,"HDR API v3: original DuplicateOutput fallback (0x%08lx)",hr); }
+        bool report = false;
+        HRESULT hr = hdr_duplication_create(self,device,DXGI_FORMAT_B8G8R8A8_UNORM,out,&report);
+        if (hr == S_OK || report) return hr;
+        if (FAILED(hr)) { InterlockedIncrement(&hdr_fallbacks); core_log(0,"HDR API v3: every HDR source failed, Parsec's original DuplicateOutput runs unchanged (0x%08lx)",hr); }
     }
     ++native_duplication; HRESULT hr = fn(self,device,out); --native_duplication;
+    return hr;
+}
+HRESULT api_native_duplicate1(IDXGIOutput *output, IUnknown *device, UINT count, const DXGI_FORMAT *formats, IDXGIOutputDuplication **out)
+{
+    ComPtr<IDXGIOutput5> output5;
+    HRESULT hr = output->QueryInterface(IID_PPV_ARGS(&output5));
+    if (FAILED(hr)) return hr;
+    // Goes through the hooked slot; the guard makes the hook call the original.
+    ++native_duplication; hr = output5->DuplicateOutput1(device,0,count,formats,out); --native_duplication;
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE duplicate1(IDXGIOutput5 *self, IUnknown *device, UINT flags, UINT count,
@@ -100,13 +111,22 @@ static HRESULT STDMETHODCALLTYPE duplicate1(IDXGIOutput5 *self, IUnknown *device
 {
     auto fn = original_method<decltype(&duplicate1)>(self, slot_output_duplicate1);
     if (!fn) return E_FAIL;
-    bool bgra = false;
-    if (formats) for (UINT i=0; i<count; ++i) if (formats[i] == DXGI_FORMAT_B8G8R8A8_UNORM) bgra = true;
-    if (!native_duplication && device && out && !flags && bgra) {
+    // Parsec asks for {B8G8R8A8, R8G8B8A8}, or only {R10G10B10A2} with 10-bit color.
+    // Deliver the first of the caller's formats that the tone mapper can render.
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    if (formats) for (UINT i=0; i<count && !format; ++i)
+        if (formats[i] == DXGI_FORMAT_B8G8R8A8_UNORM || formats[i] == DXGI_FORMAT_R10G10B10A2_UNORM) format = formats[i];
+    if (!native_duplication && device && out && !flags && format) {
         InterlockedIncrement(&hdr_duplication_calls);
-        HRESULT hr = hdr_duplication_create(self,device,out);
-        if (hr == S_OK) return hr;
-        if (FAILED(hr)) { InterlockedIncrement(&hdr_fallbacks); core_log(0,"HDR API v3: original DuplicateOutput1 fallback (0x%08lx)",hr); }
+        bool report = false;
+        HRESULT hr = hdr_duplication_create(self,device,format,out,&report);
+        if (hr == S_OK || report) return hr;
+        if (FAILED(hr)) { InterlockedIncrement(&hdr_fallbacks); core_log(0,"HDR API v3: every HDR source failed, Parsec's original DuplicateOutput1 runs unchanged (0x%08lx)",hr); }
+    } else if (!native_duplication && device && out) {
+        char list[128] = ""; size_t used = 0;
+        for (UINT i=0; formats && i<count && used+12<sizeof(list); ++i)
+            used += snprintf(list+used,sizeof(list)-used,"%s%d",i?",":"",int(formats[i]));
+        core_log(0,"HDR API v3: DuplicateOutput1 not intercepted (flags 0x%x, formats [%s]), Parsec capture unchanged",flags,list);
     }
     ++native_duplication; HRESULT hr = fn(self,device,flags,count,formats,out); --native_duplication;
     return hr;
@@ -136,8 +156,14 @@ static void hook_adapter(IUnknown *adapter)
 void api_hook_factory(IUnknown *factory)
 {
     shim_pin();
-    if(InterlockedIncrement(&hdr_factories)==1)
-        core_log(1,"HDR API v3: Windows DXGI factory intercepted (PID %lu)",GetCurrentProcessId());
+    if(InterlockedIncrement(&hdr_factories)==1) {
+        RTL_OSVERSIONINFOW os {sizeof(os)};
+        using GET_VERSION = LONG (WINAPI *)(RTL_OSVERSIONINFOW *);
+        if (auto get_version = reinterpret_cast<GET_VERSION>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"RtlGetVersion"))) get_version(&os);
+        wchar_t exe[MAX_PATH] = L""; GetModuleFileNameW(nullptr,exe,_countof(exe));
+        core_log(1,"HDR API v3: Windows DXGI factory intercepted (PID %lu, %ls, Windows %lu.%lu.%lu)",
+            GetCurrentProcessId(),exe,os.dwMajorVersion,os.dwMinorVersion,os.dwBuildNumber);
+    }
     const IID *ids[] = {&__uuidof(IDXGIFactory),&__uuidof(IDXGIFactory1),&__uuidof(IDXGIFactory2),
         &__uuidof(IDXGIFactory3),&__uuidof(IDXGIFactory4),&__uuidof(IDXGIFactory5),&__uuidof(IDXGIFactory6),&__uuidof(IDXGIFactory7)};
     for (unsigned i=0; i<_countof(ids); ++i) {

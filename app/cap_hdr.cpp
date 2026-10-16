@@ -8,6 +8,7 @@
 #include <cwchar>
 #include <new>
 #include <cmath>
+#include <cstring>
 
 using Microsoft::WRL::ComPtr;
 struct CAP_HDR {
@@ -17,13 +18,14 @@ struct CAP_HDR {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
     ComPtr<ID3D11Buffer> constants;
-    ComPtr<ID3D11Texture2D> input, target;
-    ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11Texture2D> input, target, source;
+    ComPtr<ID3D11ShaderResourceView> srv, source_srv;
     ComPtr<ID3D11RenderTargetView> rtv;
-    bool enabled = false, warned = false;
+    bool enabled = false;
     float white = 1;
+    float params[4] = {}; // Last uploaded constants; skipped when unchanged.
+    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
     ULONGLONG checked = 0;
-    DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
 };
 
 static float cap_hdr_white(const wchar_t *name)
@@ -51,11 +53,11 @@ static float cap_hdr_white(const wchar_t *name)
     return 0; // Caller retains last known value, initially the Windows 80-nit baseline.
 }
 
-CAP_HDR *cap_hdr_create(ID3D11Device *device, IDXGIOutput *output)
+CAP_HDR *cap_hdr_create(ID3D11Device *device, IDXGIOutput *output, DXGI_FORMAT target)
 {
     auto *p = new (std::nothrow) CAP_HDR;
     if (!p) return nullptr;
-    p->device = device;
+    p->device = device; p->format = target;
     device->GetImmediateContext(&p->context);
     if (output) output->QueryInterface(IID_PPV_ARGS(&p->output));
     DXGI_OUTPUT_DESC1 desc {};
@@ -93,14 +95,15 @@ bool cap_hdr_refresh(CAP_HDR *p)
     return true;
 }
 
-HRESULT cap_hdr_render(CAP_HDR *p, ID3D11Texture2D *source, float white, ID3D11Texture2D **out, DXGI_MODE_ROTATION rotation)
+// Draws source into target; the caller guarantees the target is the rotated size.
+static HRESULT cap_hdr_draw_into(CAP_HDR *p, ID3D11Texture2D *source, float white, ID3D11RenderTargetView *target,
+    DXGI_MODE_ROTATION rotation)
 {
-    if (!out) return E_INVALIDARG;
-    *out = nullptr;
-    if (!p || !source || !std::isfinite(white) || white <= 0) return E_INVALIDARG;
+    if (!p || !source || !target || !std::isfinite(white) || white <= 0) return E_INVALIDARG;
     if (rotation < DXGI_MODE_ROTATION_IDENTITY || rotation > DXGI_MODE_ROTATION_ROTATE270) return E_INVALIDARG;
     D3D11_TEXTURE2D_DESC desc {}; source->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1)
+    const bool sdr = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+    if ((desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && !sdr) || desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1)
         return E_INVALIDARG;
     HRESULT hr;
     if (!p->vs && FAILED(hr = p->device->CreateVertexShader(cap_hdr_vs, sizeof(cap_hdr_vs), nullptr, &p->vs))) return hr;
@@ -109,26 +112,34 @@ HRESULT cap_hdr_render(CAP_HDR *p, ID3D11Texture2D *source, float white, ID3D11T
         D3D11_BUFFER_DESC cb {}; cb.ByteWidth = 16; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         if (FAILED(hr = p->device->CreateBuffer(&cb, nullptr, &p->constants))) return hr;
     }
-    D3D11_TEXTURE2D_DESC old {}; if (p->input) p->input->GetDesc(&old);
+    auto *c = p->context.Get();
+    ID3D11ShaderResourceView *view = nullptr;
+    if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+        // Read the source in place. DXGI duplication reuses one texture, so the view is cached.
+        if (p->source.Get() != source) {
+            p->source_srv.Reset(); p->source = source;
+            if (FAILED(hr = p->device->CreateShaderResourceView(source, nullptr, &p->source_srv))) { p->source.Reset(); return hr; }
+        }
+        view = p->source_srv.Get();
+    } else {
+        // E.g. the user-session worker's shared texture: copy it to a readable one first.
+        D3D11_TEXTURE2D_DESC old {}; if (p->input) p->input->GetDesc(&old);
+        if (!p->srv || old.Width != desc.Width || old.Height != desc.Height || old.Format != desc.Format) {
+            p->srv.Reset(); p->input.Reset();
+            desc.Usage = D3D11_USAGE_DEFAULT; desc.CPUAccessFlags = desc.MiscFlags = 0;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(hr = p->device->CreateTexture2D(&desc, nullptr, &p->input))) return hr;
+            if (FAILED(hr = p->device->CreateShaderResourceView(p->input.Get(), nullptr, &p->srv))) return hr;
+        }
+        c->CopyResource(p->input.Get(), source);
+        view = p->srv.Get();
+    }
     const bool swap = rotation == DXGI_MODE_ROTATION_ROTATE90 || rotation == DXGI_MODE_ROTATION_ROTATE270;
     const UINT width = swap ? desc.Height : desc.Width, height = swap ? desc.Width : desc.Height;
-    if (!p->rtv || old.Width != desc.Width || old.Height != desc.Height || p->rotation != rotation) {
-        p->srv.Reset(); p->rtv.Reset(); p->input.Reset(); p->target.Reset();
-        desc.Usage = D3D11_USAGE_DEFAULT; desc.CPUAccessFlags = desc.MiscFlags = 0;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(hr = p->device->CreateTexture2D(&desc, nullptr, &p->input))) return hr;
-        if (FAILED(hr = p->device->CreateShaderResourceView(p->input.Get(), nullptr, &p->srv))) return hr;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.Width = width; desc.Height = height;
-        desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
-        if (FAILED(hr = p->device->CreateTexture2D(&desc, nullptr, &p->target))) return hr;
-        if (FAILED(hr = p->device->CreateRenderTargetView(p->target.Get(), nullptr, &p->rtv))) return hr;
-        p->rotation = rotation;
+    const float params[4] = {white, float(rotation), sdr ? 1.0f : 0.0f, 0};
+    if (memcmp(params, p->params, sizeof(params))) {
+        c->UpdateSubresource(p->constants.Get(), 0, nullptr, params, 0, 0); memcpy(p->params, params, sizeof(params));
     }
-    auto *c = p->context.Get();
-    // Duplication textures need not have shader-resource binding; copy entirely on GPU.
-    c->CopyResource(p->input.Get(), source);
-    float params[4] = {white, float(rotation), 0, 0}; c->UpdateSubresource(p->constants.Get(), 0, nullptr, params, 0, 0);
     D3D11_VIEWPORT viewport = {0, 0, float(width), float(height), 0, 1};
     c->IASetInputLayout(nullptr); c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     c->VSSetShader(p->vs.Get(), nullptr, 0); c->PSSetShader(p->ps.Get(), nullptr, 0);
@@ -136,29 +147,37 @@ HRESULT cap_hdr_render(CAP_HDR *p, ID3D11Texture2D *source, float white, ID3D11T
     c->RSSetState(nullptr); c->RSSetViewports(1, &viewport);
     c->OMSetBlendState(nullptr, nullptr, 0xffffffff); c->OMSetDepthStencilState(nullptr, 0);
     c->PSSetConstantBuffers(0, 1, p->constants.GetAddressOf());
-    c->PSSetShaderResources(0, 1, p->srv.GetAddressOf());
-    c->OMSetRenderTargets(1, p->rtv.GetAddressOf(), nullptr); c->Draw(3, 0);
+    c->PSSetShaderResources(0, 1, &view);
+    c->OMSetRenderTargets(1, &target, nullptr); c->Draw(3, 0);
     ID3D11ShaderResourceView *none = nullptr; c->PSSetShaderResources(0, 1, &none);
     c->OMSetRenderTargets(0, nullptr, nullptr);
-    hr = p->device->GetDeviceRemovedReason();
-    if (FAILED(hr)) return hr;
-    *out = p->target.Get(); (*out)->AddRef();
-    return S_OK;
+    return p->device->GetDeviceRemovedReason();
 }
 
-HRESULT cap_hdr_convert(CAP_HDR *p, ID3D11Texture2D **texture, DXGI_MODE_ROTATION rotation)
+HRESULT cap_hdr_draw(CAP_HDR *p, ID3D11Texture2D *source, ID3D11RenderTargetView *target, DXGI_MODE_ROTATION rotation)
 {
-    if (!p || !texture || !*texture) return E_INVALIDARG;
-    D3D11_TEXTURE2D_DESC desc {}; (*texture)->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        if (p->enabled && !p->warned) {
-            core_log(0, "Host HDR -> SDR: rejecting non-FP16 capture; clipped SDR data cannot be tone mapped as HDR");
-            p->warned = true;
-        }
-        return p->enabled ? DXGI_ERROR_UNSUPPORTED : S_OK;
+    if (!p) return E_INVALIDARG;
+    return cap_hdr_draw_into(p, source, p->enabled ? p->white : 1.0f, target, rotation);
+}
+
+HRESULT cap_hdr_render(CAP_HDR *p, ID3D11Texture2D *source, float white, ID3D11Texture2D **out, DXGI_MODE_ROTATION rotation)
+{
+    if (!out) return E_INVALIDARG;
+    *out = nullptr;
+    if (!p || !source) return E_INVALIDARG;
+    D3D11_TEXTURE2D_DESC desc {}; source->GetDesc(&desc);
+    const bool swap = rotation == DXGI_MODE_ROTATION_ROTATE90 || rotation == DXGI_MODE_ROTATION_ROTATE270;
+    const UINT width = swap ? desc.Height : desc.Width, height = swap ? desc.Width : desc.Height;
+    D3D11_TEXTURE2D_DESC old {}; if (p->target) p->target->GetDesc(&old);
+    HRESULT hr;
+    if (!p->rtv || old.Width != width || old.Height != height) {
+        p->rtv.Reset(); p->target.Reset();
+        D3D11_TEXTURE2D_DESC td {}; td.Width = width; td.Height = height; td.MipLevels = td.ArraySize = 1;
+        td.Format = p->format; td.SampleDesc.Count = 1; td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(hr = p->device->CreateTexture2D(&td, nullptr, &p->target))) return hr;
+        if (FAILED(hr = p->device->CreateRenderTargetView(p->target.Get(), nullptr, &p->rtv))) return hr;
     }
-    ID3D11Texture2D *converted = nullptr;
-    HRESULT hr = cap_hdr_render(p, *texture, p->enabled ? p->white : 1.0f, &converted, rotation);
-    if (SUCCEEDED(hr)) { (*texture)->Release(); *texture = converted; }
-    return hr;
+    if (FAILED(hr = cap_hdr_draw_into(p, source, white, p->rtv.Get(), rotation))) return hr;
+    *out = p->target.Get(); (*out)->AddRef();
+    return S_OK;
 }
